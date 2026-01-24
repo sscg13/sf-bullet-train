@@ -34,7 +34,7 @@ impl OutputBuckets<ChessBoard> for SfMaterialCount {
     }
 }
 
-const L1: usize = 1024;
+const L1: usize = 128;
 const L2: usize = 15;
 const L3: usize = 32;
 
@@ -43,16 +43,21 @@ fn merge_factoriser(weights: &[f32], output_size: usize) -> Vec<f32> {
     let factorised_end = output_size * ThreatInputsBucketsMirrored::FACTORISER_SIZE;
     let factorised_weights = &weights[0..factorised_end];
 
-    let halfkav2_end = factorised_end + output_size * ThreatInputsBucketsMirrored::HALFKA_V2_SIZE;
-    let halfkav2_weights = &weights[factorised_end..halfkav2_end];
+    let feature_end = factorised_end + output_size * (ThreatInputsBucketsMirrored::HALFKA_V2_SIZE + ThreatInputsBucketsMirrored::THREATS_SIZE);
+    let feature_weights = &weights[factorised_end..feature_end];
 
-    (0..output_size * ThreatInputsBucketsMirrored::HALFKA_V2_SIZE)
+    (0..output_size * (ThreatInputsBucketsMirrored::HALFKA_V2_SIZE + ThreatInputsBucketsMirrored::THREATS_SIZE))
         .map(|idx| {
             let feature = idx / output_size;
-            let l1 = idx % output_size;
-            let factorised_feature =
-                ThreatInputsBucketsMirrored::derive_factorised_feature(feature);
-            halfkav2_weights[idx] + factorised_weights[factorised_feature * output_size + l1]
+            if feature >= ThreatInputsBucketsMirrored::HALFKA_V2_SIZE {
+                feature_weights[idx]
+            }
+            else {
+                let l1 = idx % output_size;
+                let factorised_feature =
+                    ThreatInputsBucketsMirrored::derive_factorised_feature(feature);
+                feature_weights[idx] + factorised_weights[factorised_feature * output_size + l1]
+            }
         })
         .collect::<Vec<f32>>()
 }
@@ -65,23 +70,7 @@ fn main() {
 
     let saved_format = vec![
         SavedFormat::id("l0b").round().quantise::<i16>(255),
-        // Threat weights
-        SavedFormat::id("l0w")
-            .transform(move |_, weights| {
-                let start = L1
-                    * (ThreatInputsBucketsMirrored::FACTORISER_SIZE
-                        + ThreatInputsBucketsMirrored::HALFKA_V2_SIZE);
-                let end = start + L1 * ThreatInputsBucketsMirrored::THREATS_SIZE;
-                let threat_weights = &weights[start..end];
-
-                threat_weights
-                    .iter()
-                    .map(|w| w.clamp(-0.99, 0.99)) // with the default weight clamping of [-1.98, 1.98] and QA=255, this is required to quantise correctly
-                    .collect()
-            })
-            .round()
-            .quantise::<i8>(255),
-        // HalfKAv2 weights
+        // weights
         SavedFormat::id("l0w")
             .transform(move |_, weights| merge_factoriser(&weights, L1))
             .round()
@@ -132,7 +121,8 @@ fn main() {
                 Shape::new(
                     NUM_OUTPUT_BUCKETS,
                     ThreatInputsBucketsMirrored::FACTORISER_SIZE
-                        + ThreatInputsBucketsMirrored::HALFKA_V2_SIZE,
+                        + ThreatInputsBucketsMirrored::HALFKA_V2_SIZE
+                        + ThreatInputsBucketsMirrored::THREATS_SIZE,
                 ),
                 InitSettings::Zeroed,
             );
@@ -153,10 +143,8 @@ fn main() {
             out = l2.forward(out).select(buckets).crelu();
             out = l3.forward(out).select(buckets);
 
-            let pst_slice_end = ThreatInputsBucketsMirrored::FACTORISER_SIZE
-                + ThreatInputsBucketsMirrored::HALFKA_V2_SIZE;
-            let stm_pst = pst.matmul(stm.slice_rows(0, pst_slice_end)).select(buckets);
-            let ntm_pst = pst.matmul(ntm.slice_rows(0, pst_slice_end)).select(buckets);
+            let stm_pst = pst.matmul(stm).select(buckets);
+            let ntm_pst = pst.matmul(ntm).select(buckets);
             let pst_out = stm_pst.linear_comb(0.5, ntm_pst, -0.5);
             out = out + skip_neuron + pst_out;
 
@@ -181,7 +169,7 @@ fn main() {
             batch_size: 16_384,
             batches_per_superbatch: 1024,
             start_superbatch: 1,
-            end_superbatch: 1,
+            end_superbatch: 150,
         },
         wdl_scheduler: wdl::ConstantWDL { value: 0.0 },
         lr_scheduler: lr::StepLR {
@@ -200,7 +188,7 @@ fn main() {
     };
 
     let data_loader = {
-        let file_path = "/mnt/d/Chess Data/aprilmay2022/T79-apr2022-12tb7p.binpack";
+        let file_path = "../leela.binpack";
         let buffer_size_mb = 1024;
         let threads = 8;
         fn filter(entry: &TrainingDataEntry) -> bool {
