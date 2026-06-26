@@ -43,16 +43,19 @@ fn merge_factoriser(weights: &[f32], output_size: usize) -> Vec<f32> {
     let factorised_end = output_size * ThreatInputsBucketsMirrored::FACTORISER_SIZE;
     let factorised_weights = &weights[0..factorised_end];
 
-    let feature_end = factorised_end + output_size * (ThreatInputsBucketsMirrored::HALFKA_V2_SIZE + ThreatInputsBucketsMirrored::THREATS_SIZE);
+    let feature_end = factorised_end
+        + output_size
+            * (ThreatInputsBucketsMirrored::HALFKA_V2_SIZE
+                + ThreatInputsBucketsMirrored::THREATS_SIZE);
     let feature_weights = &weights[factorised_end..feature_end];
 
-    (0..output_size * (ThreatInputsBucketsMirrored::HALFKA_V2_SIZE + ThreatInputsBucketsMirrored::THREATS_SIZE))
+    (0..output_size
+        * (ThreatInputsBucketsMirrored::HALFKA_V2_SIZE + ThreatInputsBucketsMirrored::THREATS_SIZE))
         .map(|idx| {
             let feature = idx / output_size;
             if feature >= ThreatInputsBucketsMirrored::HALFKA_V2_SIZE {
                 feature_weights[idx]
-            }
-            else {
+            } else {
                 let l1 = idx % output_size;
                 let factorised_feature =
                     ThreatInputsBucketsMirrored::derive_factorised_feature(feature);
@@ -145,7 +148,7 @@ fn main() {
 
             let stm_pst = pst.matmul(stm).select(buckets);
             let ntm_pst = pst.matmul(ntm).select(buckets);
-            let pst_out = stm_pst.linear_comb(0.5, ntm_pst, -0.5);
+            let pst_out = 0.5 * stm_pst - 0.5 * ntm_pst;
             out = out + skip_neuron + pst_out;
 
             out
@@ -160,7 +163,14 @@ fn main() {
         },
     );
 
-    println!("Params: {}", trainer.optimiser.graph.get_num_params());
+    let num_params: usize = trainer
+        .optimiser
+        .cpu_weights()
+        .unwrap()
+        .iter()
+        .map(|(_, weights)| weights.shape.size())
+        .sum();
+    println!("Params: {num_params}");
 
     let schedule = TrainingSchedule {
         net_id: "test".to_string(),
@@ -188,7 +198,7 @@ fn main() {
     };
 
     let data_loader = {
-        let file_path = "../leela.binpack";
+        let file_path = "small.binpack";
         let buffer_size_mb = 1024;
         let threads = 8;
         fn filter(entry: &TrainingDataEntry) -> bool {
