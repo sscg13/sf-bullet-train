@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import os
 import tempfile
+import warnings
 from pathlib import Path
 
 FULL_THREATS_HASH = 0x8F234CB8
@@ -115,9 +116,24 @@ def organize_into_buckets(data, L1, L2, L3, num_buckets=8):
         'l2': [],
         'l3': []
     }
-    # Clip threat weights
+    clipped_threat_weights = 0
+    clipped_threat_min = None
+    clipped_threat_max = None
     for weight_idx in range(FULL_THREATS_FEATURES * L1):
-        bucketed_data['l0t'].append(max(min(data['l0t'][weight_idx], 127), -128))
+        weight = data['l0t'][weight_idx]
+        if weight < -127 or weight > 127:
+            clipped_threat_weights += 1
+            clipped_threat_min = weight if clipped_threat_min is None else min(clipped_threat_min, weight)
+            clipped_threat_max = weight if clipped_threat_max is None else max(clipped_threat_max, weight)
+            weight = max(min(weight, 127), -127)
+        bucketed_data['l0t'].append(weight)
+
+    if clipped_threat_weights:
+        warnings.warn(
+            f"Clamped {clipped_threat_weights} Full_Threats weights to int8 range "
+            f"[-127, 127]; original range was [{clipped_threat_min}, {clipped_threat_max}].",
+            RuntimeWarning,
+        )
         
     # Bullet writes HalfKAv2_hm first and Full_Threats second. nnue-pytorch
     # serializes the composed feature set as Full_Threats+HalfKAv2_hm^.

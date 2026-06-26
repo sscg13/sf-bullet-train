@@ -9,7 +9,7 @@ use bullet::{
     },
     nn::{
         optimiser::{Ranger, RangerParams},
-        InitSettings, Shape,
+        Affine, InitSettings, ModelNode, Shape,
     },
     trainer::{
         save::SavedFormat,
@@ -34,9 +34,23 @@ impl OutputBuckets<ChessBoard> for SfMaterialCount {
     }
 }
 
-const L1: usize = 128;
-const L2: usize = 15;
+const L1: usize = 256;
+const L2: usize = 31;
 const L3: usize = 32;
+
+const FT_QUANTIZED_ONE: i16 = 256;
+const FT_QUANTIZED_MAX: i16 = 255;
+const HIDDEN_QUANTIZED_ONE: i16 = 128;
+const HIDDEN_QUANTIZED_MAX: i16 = 127;
+const WEIGHT_SCALE_L1: i16 = 128;
+const WEIGHT_SCALE_L2: i16 = 64;
+const WEIGHT_SCALE_OUT: i16 = 128;
+const PSQT_SCALE: i32 = 600 * 16;
+const OUTPUT_DENOMINATOR: i32 = HIDDEN_QUANTIZED_ONE as i32 * WEIGHT_SCALE_OUT as i32 * 2;
+const FAKE_QUANTIZE_EPS: f32 = 1e-5;
+
+const FT_ACT_MAX: f32 = FT_QUANTIZED_MAX as f32 / FT_QUANTIZED_ONE as f32;
+const HIDDEN_ACT_MAX: f32 = HIDDEN_QUANTIZED_MAX as f32 / HIDDEN_QUANTIZED_ONE as f32;
 
 /// assumes the ThreatInputsBucketsMirrored input type, and that `weights` contains first the factoriser weights, and then the rest
 fn merge_factoriser(weights: &[f32], output_size: usize) -> Vec<f32> {
@@ -65,6 +79,19 @@ fn merge_factoriser(weights: &[f32], output_size: usize) -> Vec<f32> {
         .collect::<Vec<f32>>()
 }
 
+fn quantised_affine_forward<'a>(
+    layer: Affine<'a>,
+    input: ModelNode<'a>,
+    weight_scale: i16,
+    bias_scale: i32,
+) -> ModelNode<'a> {
+    layer
+        .weights
+        .faux_quantise(weight_scale as f32, true)
+        .matmul(input)
+        + layer.bias.faux_quantise(bias_scale as f32, true)
+}
+
 fn main() {
     let inputs = ThreatInputsBucketsMirrored::default();
 
@@ -72,36 +99,38 @@ fn main() {
     const NUM_OUTPUT_BUCKETS: usize = <SfMaterialCount as outputs::OutputBuckets<_>>::BUCKETS;
 
     let saved_format = vec![
-        SavedFormat::id("l0b").round().quantise::<i16>(255),
+        SavedFormat::id("l0b")
+            .round()
+            .quantise::<i16>(FT_QUANTIZED_ONE),
         // weights
         SavedFormat::id("l0w")
             .transform(move |_, weights| merge_factoriser(&weights, L1))
             .round()
-            .quantise::<i16>(255),
+            .quantise::<i16>(FT_QUANTIZED_ONE),
         SavedFormat::id("pst")
             .transform(move |_, weights| merge_factoriser(&weights, NUM_OUTPUT_BUCKETS))
             .round()
-            .quantise::<i32>(600 * 16),
-        SavedFormat::id("l1b").round().quantise::<i32>(64 * 127), /*.transform(|store, weights| {
-                                                                      let fact = store.get("l1_factb").values.repeat(NUM_OUTPUT_BUCKETS);
-                                                                      weights.into_iter().zip(fact).map(|(a, b)| a + b).collect()
-                                                                  }),*/
+            .quantise::<i32>(PSQT_SCALE),
+        SavedFormat::id("l1b")
+            .round()
+            .quantise::<i32>((WEIGHT_SCALE_L1 as i32) * (HIDDEN_QUANTIZED_ONE as i32)),
         SavedFormat::id("l1w")
             .round()
-            .quantise::<i8>(64)
-            .transpose(), /*.transform(|store, weights| {
-                              let fact = store.get("l1_factw").values.repeat(NUM_OUTPUT_BUCKETS);
-                              weights.into_iter().zip(fact).map(|(a, b)| a + b).collect()
-                          }),*/
-        SavedFormat::id("l2b").round().quantise::<i32>(64 * 127),
+            .quantise::<i8>(WEIGHT_SCALE_L1)
+            .transpose(),
+        SavedFormat::id("l2b")
+            .round()
+            .quantise::<i32>((WEIGHT_SCALE_L2 as i32) * (HIDDEN_QUANTIZED_ONE as i32)),
         SavedFormat::id("l2w")
             .round()
-            .quantise::<i8>(64)
+            .quantise::<i8>(WEIGHT_SCALE_L2)
             .transpose(),
-        SavedFormat::id("l3b").round().quantise::<i32>(16 * 600),
+        SavedFormat::id("l3b")
+            .round()
+            .quantise::<i32>((WEIGHT_SCALE_OUT as i32) * (HIDDEN_QUANTIZED_ONE as i32)),
         SavedFormat::id("l3w")
             .round()
-            .quantise::<i8>(600 * 16 / 127)
+            .quantise::<i8>(WEIGHT_SCALE_OUT)
             .transpose(),
     ];
 
@@ -131,25 +160,62 @@ fn main() {
             );
 
             // inference
-            let stm_subnet = l0.forward(stm).crelu().pairwise_mul();
-            let ntm_subnet = l0.forward(ntm).crelu().pairwise_mul();
+            let stm_subnet =
+                (quantised_affine_forward(l0, stm, FT_QUANTIZED_ONE, FT_QUANTIZED_ONE as i32)
+                    .clip_pass_through_grad(0.0, FT_ACT_MAX))
+                .pairwise_mul()
+                .faux_quantise(HIDDEN_QUANTIZED_ONE as f32, false);
+            let ntm_subnet =
+                (quantised_affine_forward(l0, ntm, FT_QUANTIZED_ONE, FT_QUANTIZED_ONE as i32)
+                    .clip_pass_through_grad(0.0, FT_ACT_MAX))
+                .pairwise_mul()
+                .faux_quantise(HIDDEN_QUANTIZED_ONE as f32, false);
             let mut out = stm_subnet.concat(ntm_subnet);
 
-            out = l1.forward(out).select(buckets); // + l1_fact.forward(out);
+            out = quantised_affine_forward(
+                l1,
+                out,
+                WEIGHT_SCALE_L1,
+                (WEIGHT_SCALE_L1 as i32) * (HIDDEN_QUANTIZED_ONE as i32),
+            )
+            .select(buckets); // + l1_fact.forward(out);
 
             let skip_neuron = out.slice_rows(15, 16);
             out = out.slice_rows(0, 15);
 
-            out = out.abs_pow(2.0).concat(out);
-            out = out.crelu();
+            let squared = (out.abs_pow(2.0) + FAKE_QUANTIZE_EPS)
+                .faux_quantise(HIDDEN_QUANTIZED_ONE as f32, false);
+            let linear =
+                (out + FAKE_QUANTIZE_EPS).faux_quantise(HIDDEN_QUANTIZED_ONE as f32, false);
+            out = squared
+                .concat(linear)
+                .clip_pass_through_grad(0.0, HIDDEN_ACT_MAX);
 
-            out = l2.forward(out).select(buckets).crelu();
-            out = l3.forward(out).select(buckets);
+            out = (quantised_affine_forward(
+                l2,
+                out,
+                WEIGHT_SCALE_L2,
+                (WEIGHT_SCALE_L2 as i32) * (HIDDEN_QUANTIZED_ONE as i32),
+            )
+            .select(buckets)
+                + FAKE_QUANTIZE_EPS)
+                .faux_quantise(HIDDEN_QUANTIZED_ONE as f32, false)
+                .clip_pass_through_grad(0.0, HIDDEN_ACT_MAX);
+            out = quantised_affine_forward(
+                l3,
+                out,
+                WEIGHT_SCALE_OUT,
+                (WEIGHT_SCALE_OUT as i32) * (HIDDEN_QUANTIZED_ONE as i32),
+            )
+            .select(buckets);
 
             let stm_pst = pst.matmul(stm).select(buckets);
             let ntm_pst = pst.matmul(ntm).select(buckets);
             let pst_out = 0.5 * stm_pst - 0.5 * ntm_pst;
-            out = out + skip_neuron + pst_out;
+            out = (out + skip_neuron)
+                .faux_quantise(OUTPUT_DENOMINATOR as f32, true)
+                .faux_quantise(PSQT_SCALE as f32, false)
+                + pst_out;
 
             out
         });
@@ -157,8 +223,8 @@ fn main() {
     trainer.optimiser.set_params_for_weight(
         "l3w",
         RangerParams {
-            min_weight: -1.68,
-            max_weight: 1.68,
+            min_weight: -(HIDDEN_QUANTIZED_MAX as f32 / WEIGHT_SCALE_OUT as f32),
+            max_weight: HIDDEN_QUANTIZED_MAX as f32 / WEIGHT_SCALE_OUT as f32,
             ..Default::default()
         },
     );
