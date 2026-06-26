@@ -77,6 +77,39 @@ fn merge_factoriser(weights: &[f32], output_size: usize) -> Vec<f32> {
         .collect::<Vec<f32>>()
 }
 
+fn clamp_i8_quantisation(id: &'static str, weights: Vec<f32>, scale: i16) -> Vec<f32> {
+    let scale = f64::from(scale);
+    let mut clamped = 0;
+    let mut min_seen = f64::INFINITY;
+    let mut max_seen = f64::NEG_INFINITY;
+
+    let weights = weights
+        .into_iter()
+        .map(|weight| {
+            let quantised = (f64::from(weight) * scale).round();
+            let clamped_quantised =
+                quantised.clamp(-(HIDDEN_QUANTIZED_MAX as f64), HIDDEN_QUANTIZED_MAX as f64);
+
+            if quantised != clamped_quantised {
+                clamped += 1;
+                min_seen = min_seen.min(quantised);
+                max_seen = max_seen.max(quantised);
+            }
+
+            (clamped_quantised / scale) as f32
+        })
+        .collect::<Vec<_>>();
+
+    if clamped > 0 {
+        eprintln!(
+            "Warning: clamped {clamped} {id} weights during i8 quantisation \
+             (rounded range {min_seen:.0}..{max_seen:.0})."
+        );
+    }
+
+    weights
+}
+
 fn main() {
     let inputs = ThreatInputsBucketsMirrored::default();
 
@@ -102,21 +135,24 @@ fn main() {
         SavedFormat::id("l1w")
             .round()
             .quantise::<i8>(WEIGHT_SCALE_L1)
-            .transpose(),
+            .transpose()
+            .transform(move |_, weights| clamp_i8_quantisation("l1w", weights, WEIGHT_SCALE_L1)),
         SavedFormat::id("l2b")
             .round()
             .quantise::<i32>((WEIGHT_SCALE_L2 as i32) * (HIDDEN_QUANTIZED_ONE as i32)),
         SavedFormat::id("l2w")
             .round()
             .quantise::<i8>(WEIGHT_SCALE_L2)
-            .transpose(),
+            .transpose()
+            .transform(move |_, weights| clamp_i8_quantisation("l2w", weights, WEIGHT_SCALE_L2)),
         SavedFormat::id("l3b")
             .round()
             .quantise::<i32>((WEIGHT_SCALE_OUT as i32) * (HIDDEN_QUANTIZED_ONE as i32)),
         SavedFormat::id("l3w")
             .round()
             .quantise::<i8>(WEIGHT_SCALE_OUT)
-            .transpose(),
+            .transpose()
+            .transform(move |_, weights| clamp_i8_quantisation("l3w", weights, WEIGHT_SCALE_OUT)),
     ];
 
     let mut trainer = ValueTrainerBuilder::default()
@@ -182,6 +218,22 @@ fn main() {
         });
 
     trainer.optimiser.set_params_for_weight(
+        "l1w",
+        RangerParams {
+            min_weight: -(HIDDEN_QUANTIZED_MAX as f32 / WEIGHT_SCALE_L1 as f32),
+            max_weight: HIDDEN_QUANTIZED_MAX as f32 / WEIGHT_SCALE_L1 as f32,
+            ..Default::default()
+        },
+    );
+    trainer.optimiser.set_params_for_weight(
+        "l2w",
+        RangerParams {
+            min_weight: -(HIDDEN_QUANTIZED_MAX as f32 / WEIGHT_SCALE_L2 as f32),
+            max_weight: HIDDEN_QUANTIZED_MAX as f32 / WEIGHT_SCALE_L2 as f32,
+            ..Default::default()
+        },
+    );
+    trainer.optimiser.set_params_for_weight(
         "l3w",
         RangerParams {
             min_weight: -(HIDDEN_QUANTIZED_MAX as f32 / WEIGHT_SCALE_OUT as f32),
@@ -203,18 +255,18 @@ fn main() {
         net_id: "test".to_string(),
         eval_scale: 600.0,
         steps: TrainingSteps {
-            batch_size: 16_384,
+            batch_size: 65_536,
             batches_per_superbatch: 1024,
             start_superbatch: 1,
-            end_superbatch: 150,
+            end_superbatch: 50,
         },
         wdl_scheduler: wdl::ConstantWDL { value: 0.0 },
         lr_scheduler: lr::StepLR {
             start: 0.001,
             gamma: 0.3,
-            step: 60,
+            step: 20,
         },
-        save_rate: 150,
+        save_rate: 50,
     };
 
     let settings = LocalSettings {
