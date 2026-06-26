@@ -1,9 +1,14 @@
 import struct
 import argparse
 
-FEATURE_SET_HASH = 0x8f234cb8
-VERSION = 0x7AF32F20
+FULL_THREATS_HASH = 0x8F234CB8
+HALFKA_V2_HM_HASH = 0x7F234CB8
+FEATURE_SET_HASH = (((FULL_THREATS_HASH << 1) | (FULL_THREATS_HASH >> 31)) & 0xFFFFFFFF) ^ HALFKA_V2_HM_HASH
+VERSION = 0x6A448AFA
 DEFAULT_DESCRIPTION = "Network trained with the https://github.com/official-stockfish/nnue-pytorch trainer."
+HALFKA_V2_REAL_FEATURES = 704 * 32
+FULL_THREATS_FEATURES = 60_720
+FEATURE_TRANSFORMER_FEATURES = HALFKA_V2_REAL_FEATURES + FULL_THREATS_FEATURES
 
 def encode_leb_128_array(arr):
     res = []
@@ -46,9 +51,8 @@ def write_header(outfile, L1, fc_hash_val, description=DEFAULT_DESCRIPTION):
     outfile.write(struct.pack('<I', VERSION))
     
     # Write network hash
-    # halfkp_hash = fc_hash_val ^ FEATURE_SET_HASH ^ (L1 * 2)
-    halfkp_hash = 0xEC103C92
-    outfile.write(struct.pack('<I', halfkp_hash))
+    network_hash = fc_hash_val ^ FEATURE_SET_HASH ^ (L1 * 2)
+    outfile.write(struct.pack('<I', network_hash))
     
     # Write description
     encoded_description = description.encode('utf-8')
@@ -67,14 +71,14 @@ def read_binary_file(filename, L1, L2, L3, num_buckets=8):
         # Read l0b (16-bit) - L1 values
         data['l0b'] = list(struct.unpack('<' + 'h' * L1, f.read(L1 * 2)))
         
-        # Read l0p (16-bit) - (22528 * L1) values 
-        data['l0p'] = list(struct.unpack('<' + 'h' * (22528 * L1), f.read(22528 * L1 * 2)))
+        # Read l0p (16-bit) - HalfKAv2_hm export weights
+        data['l0p'] = list(struct.unpack('<' + 'h' * (HALFKA_V2_REAL_FEATURES * L1), f.read(HALFKA_V2_REAL_FEATURES * L1 * 2)))
         
-        # Read l0t (16-bit) - (79856 * L1) values
-        data['l0t'] = list(struct.unpack('<' + 'h' * (79856 * L1), f.read(79856 * L1 * 2)))
+        # Read l0t (16-bit) - Full_Threats weights
+        data['l0t'] = list(struct.unpack('<' + 'h' * (FULL_THREATS_FEATURES * L1), f.read(FULL_THREATS_FEATURES * L1 * 2)))
         
-        # Read pst (32-bit) - (102384 * num_buckets) values 
-        data['pst'] = list(struct.unpack('<' + 'i' * (102384 * num_buckets), f.read(102384 * num_buckets * 4)))
+        # Read pst (32-bit) - feature PSQT weights
+        data['pst'] = list(struct.unpack('<' + 'i' * (FEATURE_TRANSFORMER_FEATURES * num_buckets), f.read(FEATURE_TRANSFORMER_FEATURES * num_buckets * 4)))
         
         # Read l1b (32-bit) - ((L2 + 1) * num_buckets) values 
         data['l1b'] = list(struct.unpack('<' + 'i' * ((L2 + 1) * num_buckets), f.read((L2 + 1) * num_buckets * 4)))
@@ -101,22 +105,24 @@ def organize_into_buckets(data, L1, L2, L3, num_buckets=8):
         'l0b': data['l0b'],  # No bucketing for l0b
         'l0t': [],  
         'l0p': data['l0p'],  # No bucketing for l0p
-        'pst': [],  # Already bucketed as inputs * 8
+        'pst_t': [],
+        'pst_p': [],
         'l1': [],
         'l2': [],
         'l3': []
     }
     # Clip threat weights
-    for weight_idx in range(79856 * L1):
+    for weight_idx in range(FULL_THREATS_FEATURES * L1):
         bucketed_data['l0t'].append(max(min(data['l0t'][weight_idx], 127), -128))
         
-    # Rearrange pst weights
-    threat_start = 22528 * num_buckets
-    threat_end = 102384 * num_buckets
+    # Bullet writes HalfKAv2_hm first and Full_Threats second. nnue-pytorch
+    # serializes the composed feature set as Full_Threats+HalfKAv2_hm^.
+    threat_start = HALFKA_V2_REAL_FEATURES * num_buckets
+    threat_end = FEATURE_TRANSFORMER_FEATURES * num_buckets
     psq_start = 0
-    psq_end = 22528 * num_buckets
-    bucketed_data['pst'].extend(data['pst'][threat_start:threat_end])
-    bucketed_data['pst'].extend(data['pst'][psq_start:psq_end])
+    psq_end = HALFKA_V2_REAL_FEATURES * num_buckets
+    bucketed_data['pst_t'].extend(data['pst'][threat_start:threat_end])
+    bucketed_data['pst_p'].extend(data['pst'][psq_start:psq_end])
     
     # Organize l1 layer (bias and weights) into buckets
     for bucket in range(num_buckets):
@@ -184,26 +190,32 @@ def convert_binary_format(input_file, output_file, L1=128, L2=15, L3=32, num_buc
     
     with open(output_file, 'wb') as outfile:
         # Write header
-        write_header(outfile, L1, "unused")
+        fc_hash_val = fc_hash(L1, L2, L3, num_buckets)
+
+        write_header(outfile, L1, fc_hash_val)
         
         # Write feature transformer hash
         feature_transformer_hash = FEATURE_SET_HASH ^ (L1 * 2)
         outfile.write(struct.pack('<I', feature_transformer_hash))
         
-        # Write l0 bias, weights and psqt in LEB128 format
+        # Write feature transformer in nnue-pytorch's composed-feature order:
+        # bias, Full_Threats weights, Full_Threats PSQT, HalfKAv2_hm weights,
+        # HalfKAv2_hm PSQT.
         outfile.write('COMPRESSED_LEB128'.encode('utf-8'))
         write_leb_128_array(outfile, bucketed_data['l0b'])
         
         outfile.write(struct.pack('<' + 'b' * len(bucketed_data['l0t']), *bucketed_data['l0t']))
+
+        outfile.write('COMPRESSED_LEB128'.encode('utf-8'))
+        write_leb_128_array(outfile, bucketed_data['pst_t'])
         
         outfile.write('COMPRESSED_LEB128'.encode('utf-8'))
         write_leb_128_array(outfile, bucketed_data['l0p'])
         
         outfile.write('COMPRESSED_LEB128'.encode('utf-8'))
-        write_leb_128_array(outfile, bucketed_data['pst'])
+        write_leb_128_array(outfile, bucketed_data['pst_p'])
         
         # Write each bucket of l1, l2 and l3 layers
-        fc_hash_val = 0x6333712A;
         for bucket in range(num_buckets):
             outfile.write(struct.pack('<I', fc_hash_val))
             
@@ -253,19 +265,7 @@ def main():
     args = parser.parse_args()
     
     convert_binary_format(args.input_file, args.output_file, args.L1, args.L2, args.L3, args.buckets)
-    test_foo(args.input_file, args.output_file)
     print(f"Conversion complete: {args.input_file} -> {args.output_file}")
-
-def test_foo(input_file, output_file):
-     with open(output_file, 'rb') as f:
-        # data = f.read()
-
-        f.seek(6439819)
-
-        four_bytes = f.read(4)
-
-        integer_value = struct.unpack('<I', four_bytes)[0]
-        print(f"Integer value at position 6439819: {integer_value}")
 
 
 if __name__ == "__main__":

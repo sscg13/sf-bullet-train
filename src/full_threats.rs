@@ -1,4 +1,4 @@
-/* A large part of this file is taken or adapted from montytrain (https://github.com/official-monty/montytrain) */
+/* Attack generation is adapted from montytrain (https://github.com/official-monty/montytrain). */
 
 use bullet::game::inputs::SparseInputType;
 use bulletformat::ChessBoard;
@@ -11,23 +11,6 @@ macro_rules! init {
             res[$sq] = {$($rest)+};
             $sq += 1;
         }
-        res
-    }};
-}
-
-macro_rules! init_add_assign {
-    (|$sq:ident, $init:expr, $size:literal | $($rest:tt)+) => {{
-        let mut $sq = 0;
-        let mut res = [{$($rest)+}; $size + 1];
-        let mut val = $init;
-        while $sq < $size {
-            res[$sq] = val;
-            val += {$($rest)+};
-            $sq += 1;
-        }
-
-        res[$size] = val;
-
         res
     }};
 }
@@ -48,33 +31,118 @@ impl Piece {
     pub const KING: usize = 7;
 }
 
+const PAWN_TYPE: usize = Piece::PAWN - 2;
+const KNIGHT_TYPE: usize = Piece::KNIGHT - 2;
+const BISHOP_TYPE: usize = Piece::BISHOP - 2;
+const ROOK_TYPE: usize = Piece::ROOK - 2;
+const QUEEN_TYPE: usize = Piece::QUEEN - 2;
+const KING_TYPE: usize = Piece::KING - 2;
+
+const NUM_VALID_TARGETS: [usize; 12] = [6, 6, 10, 10, 8, 8, 8, 8, 10, 10, 0, 0];
+const TARGET_MAP: [[i32; 6]; 6] = [
+    [0, 1, -1, 2, -1, -1],
+    [0, 1, 2, 3, 4, -1],
+    [0, 1, 2, 3, -1, -1],
+    [0, 1, 2, 3, -1, -1],
+    [0, 1, 2, 3, 4, -1],
+    [-1, -1, -1, -1, -1, -1],
+];
+
 pub mod offsets {
-    use super::indices;
-
-    pub const PAWN: usize = 0;
-    pub const KNIGHT: usize = PAWN + 6 * indices::PAWN; // pawn attacks: 6 different pieces: own pawn, own knight, own rook, opp pawn, opp knight, opp rook
-    pub const BISHOP: usize = KNIGHT + 12 * indices::KNIGHT[64]; // knight attacks: all 12 pieces possible
-    pub const ROOK: usize = BISHOP + 10 * indices::BISHOP[64]; // bishop attacks: queens are skipped
-    pub const QUEEN: usize = ROOK + 10 * indices::ROOK[64]; // rook attacks: queens are skipped
-    pub const KING: usize = QUEEN + 12 * indices::QUEEN[64]; // queen attacks: all 12 pieces possible
-    pub const END: usize = KING + 8 * indices::KING[64]; // king attacks: queen and king skipped
+    pub const END: usize = super::THREAT_FEATURES;
 }
 
-pub mod indices {
-    use super::attacks;
+type ThreatOffsetTable = [[usize; 66]; 12];
 
-    pub const PAWN: usize = 84;
-    pub const KNIGHT: [usize; 65] =
-        init_add_assign!(|sq, 0, 64| attacks::KNIGHT[sq].count_ones() as usize); // for every square (including index 64, aka total) stores the start index of threats of that square
-    pub const BISHOP: [usize; 65] =
-        init_add_assign!(|sq, 0, 64| attacks::BISHOP[sq].count_ones() as usize);
-    pub const ROOK: [usize; 65] =
-        init_add_assign!(|sq, 0, 64| attacks::ROOK[sq].count_ones() as usize);
-    pub const QUEEN: [usize; 65] =
-        init_add_assign!(|sq, 0, 64| attacks::QUEEN[sq].count_ones() as usize);
-    pub const KING: [usize; 65] =
-        init_add_assign!(|sq, 0, 64| attacks::KING[sq].count_ones() as usize);
+struct ThreatFeatureCalculation {
+    table: ThreatOffsetTable,
+    total_features: usize,
 }
+
+const fn piece_id(piece_type: usize, color: usize) -> usize {
+    2 * piece_type + color
+}
+
+const fn pawn_attacks_from(sq: usize, color: usize) -> u64 {
+    let bit = 1u64 << sq;
+    if color == Side::WHITE {
+        ((bit & !File::A) << 7) | ((bit & !File::H) << 9)
+    } else {
+        ((bit & !File::A) >> 9) | ((bit & !File::H) >> 7)
+    }
+}
+
+const fn pawn_push_from(sq: usize, color: usize) -> u64 {
+    if color == Side::WHITE {
+        if sq <= 55 {
+            1u64 << (sq + 8)
+        } else {
+            0
+        }
+    } else if sq >= 8 {
+        1u64 << (sq - 8)
+    } else {
+        0
+    }
+}
+
+const fn pseudo_attacks(piece_type: usize, sq: usize) -> u64 {
+    match piece_type {
+        KNIGHT_TYPE => attacks::KNIGHT[sq],
+        BISHOP_TYPE => attacks::BISHOP[sq],
+        ROOK_TYPE => attacks::ROOK[sq],
+        QUEEN_TYPE => attacks::QUEEN[sq],
+        KING_TYPE => attacks::KING[sq],
+        _ => 0,
+    }
+}
+
+const fn threat_feature_calculation() -> ThreatFeatureCalculation {
+    let mut table = [[0; 66]; 12];
+    let mut piece_offset = 0;
+
+    let mut color = 0;
+    while color < 2 {
+        let mut piece_type = 0;
+        while piece_type < 6 {
+            let piece = piece_id(piece_type, color);
+            table[piece][65] = piece_offset;
+
+            let mut square_offset = 0;
+            let mut from = 0;
+            while from < 64 {
+                table[piece][from] = square_offset;
+
+                if piece_type == PAWN_TYPE {
+                    if from >= 8 && from <= 55 {
+                        square_offset += (pawn_attacks_from(from, color)
+                            | pawn_push_from(from, color))
+                        .count_ones() as usize;
+                    }
+                } else {
+                    square_offset += pseudo_attacks(piece_type, from).count_ones() as usize;
+                }
+
+                from += 1;
+            }
+
+            table[piece][64] = square_offset;
+            piece_offset += NUM_VALID_TARGETS[piece] * square_offset;
+            piece_type += 1;
+        }
+        color += 1;
+    }
+
+    ThreatFeatureCalculation {
+        table,
+        total_features: piece_offset,
+    }
+}
+
+const THREAT_FEATURE_CALCULATION: ThreatFeatureCalculation = threat_feature_calculation();
+const THREAT_OFFSETS: ThreatOffsetTable = THREAT_FEATURE_CALCULATION.table;
+const THREAT_FEATURES: usize = THREAT_FEATURE_CALCULATION.total_features;
+const _: () = assert!(THREAT_FEATURES == 60_720);
 
 pub mod attacks {
     const A: u64 = 0x0101_0101_0101_0101;
@@ -287,157 +355,58 @@ const FILE: [[u64; 64]; 64] = init!(|sq, 64| init!(|occ, 64| (RANK[7 - sq / 8][o
     & File::H)
     >> (7 - (sq & 7))));
 
-pub fn map_piece_threat(
-    // maps a threat to a feature index (still need to add half width in case of nstm)
-    piece: usize,  // piece type
-    src: usize,    // square of piece type
-    dest: usize,   // square of interaction
-    target: usize, // piece (including color) on square of interaction
-    enemy: bool,   // indicates whether "target" is an enemy piece (threat or protection)
+fn orient_mask(perspective: usize, ksq: usize) -> usize {
+    let horizontal = if ksq % 8 < 4 { 0 } else { 7 };
+    let vertical = if perspective == Side::BLACK { 56 } else { 0 };
+    horizontal ^ vertical
+}
+
+fn threat_index(
+    perspective: usize,
+    mut attacker_color: usize,
+    attacker: usize,
+    mut from: usize,
+    mut to: usize,
+    mut attacked_color: usize,
+    attacked: usize,
+    ksq: usize,
 ) -> Option<usize> {
-    match piece {
-        Piece::PAWN => map_pawn_threat(src, dest, target, enemy),
-        Piece::KNIGHT => map_knight_threat(src, dest, target),
-        Piece::BISHOP => map_bishop_threat(src, dest, target),
-        Piece::ROOK => map_rook_threat(src, dest, target),
-        Piece::QUEEN => map_queen_threat(src, dest, target),
-        Piece::KING => map_king_threat(src, dest, target),
-        _ => unreachable!(),
-    }
-}
+    let enemy = attacker_color != attacked_color;
+    let orientation = orient_mask(perspective, ksq);
+    from ^= orientation;
+    to ^= orientation;
 
-fn below(src: usize, dest: usize, table: &[u64; 64]) -> usize {
-    (table[src] & ((1 << dest) - 1)).count_ones() as usize
-}
-
-const fn offset_mapping<const N: usize>(a: [usize; N]) -> [usize; 12] {
-    let mut res = [usize::MAX; 12];
-
-    let mut i = 0;
-    while i < N {
-        res[a[i] - 2] = i; // PieceType - 2 gives the STM index (0..<6)
-        res[a[i] + 4] = i + N; // PieceType + 4 gives the OPP index (6..<12)
-        i += 1;
+    if perspective == Side::BLACK {
+        attacker_color ^= 1;
+        attacked_color ^= 1;
     }
 
-    res
-}
+    let attacker_type = attacker - 2;
+    let attacked_type = attacked - 2;
+    let mapped_target = TARGET_MAP[attacker_type][attacked_type];
 
-fn target_is(target: usize, piece: usize) -> bool {
-    target % 6 == piece - 2
-}
+    if mapped_target < 0
+        || (attacker_type == attacked_type && (enemy || attacker_type != PAWN_TYPE) && from < to)
+    {
+        return None;
+    }
 
-fn map_pawn_threat(src: usize, dest: usize, target: usize, enemy: bool) -> Option<usize> {
-    // target is still a colored piece
-    const MAP: [usize; 12] = offset_mapping([Piece::PAWN, Piece::KNIGHT, Piece::ROOK]);
-    // this MAP call results in the following array:
-    // [0, 1, MAX, 2, MAX, MAX, 3, 4, MAX, 5, MAX, MAX]
-
-    // pawn <-> bishop threats are covered by the bishop attacking the pawn, same for queen
-    // for pawn <-> pawn threats, we don't cover cases where dest > src to avoid duplicates
-    // for pawn <-> pawn threats of the same color, there are never duplicates
-    if MAP[target] == usize::MAX || (enemy && dest > src && target_is(target, Piece::PAWN)) {
-        None
+    let attacker_id = piece_id(attacker_type, attacker_color);
+    let attacks = if attacker_type == PAWN_TYPE {
+        pawn_attacks_from(from, attacker_color) | pawn_push_from(from, attacker_color)
     } else {
-        let up = usize::from(dest > src);
-        let diff = dest.abs_diff(src);
-        let id = if diff == [9, 7][up] { 0 } else { 1 };
-        let attack = 2 * (src % 8) + id - 1;
-        let threat = offsets::PAWN + MAP[target] * indices::PAWN + (src / 8 - 1) * 14 + attack;
+        pseudo_attacks(attacker_type, from)
+    };
+    let below_to = (attacks & ((1u64 << to) - 1)).count_ones() as usize;
+    let target_offset =
+        attacked_color * (NUM_VALID_TARGETS[attacker_id] / 2) + mapped_target as usize;
+    let threat = THREAT_OFFSETS[attacker_id][65]
+        + target_offset * THREAT_OFFSETS[attacker_id][64]
+        + THREAT_OFFSETS[attacker_id][from]
+        + below_to;
 
-        assert!(threat < offsets::KNIGHT, "{threat}");
-
-        Some(threat)
-    }
-}
-
-fn map_knight_threat(src: usize, dest: usize, target: usize) -> Option<usize> {
-    // don't duplicate knight threats, only allow where dest < src
-    if dest > src && target_is(target, Piece::KNIGHT) {
-        None
-    } else {
-        let idx = indices::KNIGHT[src] + below(src, dest, &attacks::KNIGHT);
-        let threat = offsets::KNIGHT + target * indices::KNIGHT[64] + idx;
-
-        assert!(threat >= offsets::KNIGHT, "{threat}");
-        assert!(threat < offsets::BISHOP, "{threat}");
-
-        Some(threat)
-    }
-}
-
-fn map_bishop_threat(src: usize, dest: usize, target: usize) -> Option<usize> {
-    const MAP: [usize; 12] = offset_mapping([
-        Piece::PAWN,
-        Piece::KNIGHT,
-        Piece::BISHOP,
-        Piece::ROOK,
-        Piece::KING,
-    ]);
-    // queen attacks bishop => bishop attacks queen, so ont used here
-    if MAP[target] == usize::MAX || dest > src && target_is(target, Piece::BISHOP) {
-        None
-    } else {
-        let idx = indices::BISHOP[src] + below(src, dest, &attacks::BISHOP);
-        let threat = offsets::BISHOP + MAP[target] * indices::BISHOP[64] + idx;
-
-        assert!(threat >= offsets::BISHOP, "{threat}");
-        assert!(threat < offsets::ROOK, "{threat}");
-
-        Some(threat)
-    }
-}
-
-fn map_rook_threat(src: usize, dest: usize, target: usize) -> Option<usize> {
-    const MAP: [usize; 12] = offset_mapping([
-        Piece::PAWN,
-        Piece::KNIGHT,
-        Piece::BISHOP,
-        Piece::ROOK,
-        Piece::KING,
-    ]);
-    if MAP[target] == usize::MAX || dest > src && target_is(target, Piece::ROOK) {
-        None
-    } else {
-        let idx = indices::ROOK[src] + below(src, dest, &attacks::ROOK);
-        let threat = offsets::ROOK + MAP[target] * indices::ROOK[64] + idx;
-
-        assert!(threat >= offsets::ROOK, "{threat}");
-        assert!(threat < offsets::QUEEN, "{threat}");
-
-        Some(threat)
-    }
-}
-
-fn map_queen_threat(src: usize, dest: usize, target: usize) -> Option<usize> {
-    if dest > src && target_is(target, Piece::QUEEN) {
-        None
-    } else {
-        let idx = indices::QUEEN[src] + below(src, dest, &attacks::QUEEN);
-        let threat = offsets::QUEEN + target * indices::QUEEN[64] + idx;
-
-        assert!(threat >= offsets::QUEEN, "{threat}");
-        assert!(threat < offsets::KING, "{threat}");
-
-        Some(threat)
-    }
-}
-
-fn map_king_threat(src: usize, dest: usize, target: usize) -> Option<usize> {
-    const MAP: [usize; 12] =
-        offset_mapping([Piece::PAWN, Piece::KNIGHT, Piece::BISHOP, Piece::ROOK]);
-    if MAP[target] == usize::MAX {
-        None
-    } else {
-        let idx = indices::KING[src] + below(src, dest, &attacks::KING);
-        // piece offset + attacking piece offset + local index (made up of square offset + square-local index)
-        let threat = offsets::KING + MAP[target] * indices::KING[64] + idx;
-
-        assert!(threat >= offsets::KING, "{threat}");
-        assert!(threat < offsets::END, "{threat}");
-
-        Some(threat)
-    }
+    assert!(threat < offsets::END, "{threat}");
+    Some(threat)
 }
 
 fn map_bb<F: FnMut(usize)>(mut bb: u64, mut f: F) {
@@ -448,57 +417,102 @@ fn map_bb<F: FnMut(usize)>(mut bb: u64, mut f: F) {
     }
 }
 
-fn flip_horizontal(mut bb: u64) -> u64 {
-    const K1: u64 = 0x5555555555555555;
-    const K2: u64 = 0x3333333333333333;
-    const K4: u64 = 0x0f0f0f0f0f0f0f0f;
-    bb = ((bb >> 1) & K1) | ((bb & K1) << 1);
-    bb = ((bb >> 2) & K2) | ((bb & K2) << 2);
-    ((bb >> 4) & K4) | ((bb & K4) << 4)
-}
-
-fn map_features_bucketed<F: FnMut(usize)>(mut bbs: [u64; 8], mut f: F) {
-    // horiontal mirror (sf-like)
-    let ksq = (bbs[0] & bbs[Piece::KING]).trailing_zeros();
-    if ksq % 8 <= 3 {
-        for bb in bbs.iter_mut() {
-            *bb = flip_horizontal(*bb);
-        }
-    };
-
-    let mut pieces = [13; 64];
+fn map_full_threats<F: FnMut(usize)>(bbs: [u64; 8], perspective: usize, ksq: usize, mut f: F) {
+    let mut piece_on = [usize::MAX; 64];
+    let mut color_on = [usize::MAX; 64];
     for side in [Side::WHITE, Side::BLACK] {
         for piece in Piece::PAWN..=Piece::KING {
-            let pc = 6 * side + piece - 2;
-            map_bb(bbs[side] & bbs[piece], |sq| pieces[sq] = pc);
+            map_bb(bbs[side] & bbs[piece], |sq| {
+                piece_on[sq] = piece;
+                color_on[sq] = side;
+            });
         }
     }
 
-    let occ = bbs[0] | bbs[1];
+    let occ = bbs[Side::WHITE] | bbs[Side::BLACK];
+    let pawn_occ = bbs[Piece::PAWN];
+    let color_order = if perspective == Side::WHITE {
+        [Side::WHITE, Side::BLACK]
+    } else {
+        [Side::BLACK, Side::WHITE]
+    };
 
-    for side in [Side::WHITE, Side::BLACK] {
-        let side_offset = offsets::END * side;
-        let opps = bbs[side ^ 1];
-
+    for side in color_order {
         for piece in Piece::PAWN..=Piece::KING {
-            map_bb(bbs[side] & bbs[piece], |sq| {
-                let threats = match piece {
-                    Piece::PAWN => Attacks::pawn(sq, side),
-                    Piece::KNIGHT => Attacks::knight(sq),
-                    Piece::BISHOP => Attacks::bishop(sq, occ),
-                    Piece::ROOK => Attacks::rook(sq, occ),
-                    Piece::QUEEN => Attacks::queen(sq, occ),
-                    Piece::KING => Attacks::king(sq),
-                    _ => unreachable!(),
-                } & occ;
+            let pieces = bbs[side] & bbs[piece];
 
-                map_bb(threats, |dest| {
-                    let enemy = (1 << dest) & opps > 0;
-                    if let Some(idx) = map_piece_threat(piece, sq, dest, pieces[dest], enemy) {
-                        f(side_offset + idx);
-                    }
+            if piece == Piece::PAWN {
+                map_bb(pieces, |from| {
+                    let attacks = Attacks::pawn(from, side) & occ;
+                    map_bb(attacks, |to| {
+                        if let Some(idx) = threat_index(
+                            perspective,
+                            side,
+                            piece,
+                            from,
+                            to,
+                            color_on[to],
+                            piece_on[to],
+                            ksq,
+                        ) {
+                            f(idx);
+                        }
+                    });
+
+                    let push = (if side == Side::WHITE {
+                        if from <= 55 {
+                            1u64 << (from + 8)
+                        } else {
+                            0
+                        }
+                    } else if from >= 8 {
+                        1u64 << (from - 8)
+                    } else {
+                        0
+                    }) & pawn_occ;
+
+                    map_bb(push, |to| {
+                        if let Some(idx) = threat_index(
+                            perspective,
+                            side,
+                            piece,
+                            from,
+                            to,
+                            color_on[to],
+                            piece_on[to],
+                            ksq,
+                        ) {
+                            f(idx);
+                        }
+                    });
                 });
-            });
+            } else {
+                map_bb(pieces, |from| {
+                    let attacks = match piece {
+                        Piece::KNIGHT => Attacks::knight(from),
+                        Piece::BISHOP => Attacks::bishop(from, occ),
+                        Piece::ROOK => Attacks::rook(from, occ),
+                        Piece::QUEEN => Attacks::queen(from, occ),
+                        Piece::KING => Attacks::king(from),
+                        _ => unreachable!(),
+                    } & occ;
+
+                    map_bb(attacks, |to| {
+                        if let Some(idx) = threat_index(
+                            perspective,
+                            side,
+                            piece,
+                            from,
+                            to,
+                            color_on[to],
+                            piece_on[to],
+                            ksq,
+                        ) {
+                            f(idx);
+                        }
+                    });
+                });
+            }
         }
     }
 }
@@ -520,7 +534,7 @@ impl ThreatInputsBucketsMirrored {
     pub const MK_SIZE: usize = 704;
     pub const BUCKET_COUNT: usize = 32;
     pub const FACTORISER_SIZE: usize = 768;
-    pub const THREATS_SIZE: usize = 2 * offsets::END;
+    pub const THREATS_SIZE: usize = offsets::END;
     pub const HALFKA_V2_SIZE: usize = 704 * Self::BUCKET_COUNT;
 
     pub const THREATS_MAX_ACTIVE: usize = 128; // includes PSQ
@@ -591,19 +605,16 @@ impl SparseInputType for ThreatInputsBucketsMirrored {
 
         let mut stm_count = 0;
         let mut stm_feats = [0; Self::THREATS_MAX_ACTIVE];
-        map_features_bucketed(bbs, |stm| {
+        map_full_threats(bbs, Side::WHITE, pos.our_ksq() as usize, |stm| {
+            assert!(stm_count < Self::THREATS_MAX_ACTIVE);
             stm_feats[stm_count] = stm;
             stm_count += 1;
         });
 
-        bbs.swap(0, 1);
-        for bb in &mut bbs {
-            *bb = bb.swap_bytes();
-        }
-
         let mut ntm_count = 0;
         let mut ntm_feats = [0; Self::THREATS_MAX_ACTIVE];
-        map_features_bucketed(bbs, |ntm| {
+        map_full_threats(bbs, Side::BLACK, pos.opp_ksq() as usize, |ntm| {
+            assert!(ntm_count < Self::THREATS_MAX_ACTIVE);
             ntm_feats[ntm_count] = ntm;
             ntm_count += 1;
         });
@@ -629,6 +640,6 @@ impl SparseInputType for ThreatInputsBucketsMirrored {
     }
 
     fn description(&self) -> String {
-        "Factorised HalfKAv2 + Threat inputs".to_string()
+        "Factorised HalfKAv2 + Full_Threats inputs".to_string()
     }
 }

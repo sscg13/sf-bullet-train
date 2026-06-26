@@ -20,8 +20,8 @@ use bullet::{
 };
 use bulletformat::ChessBoard;
 
-use crate::threat_inputs::ThreatInputsBucketsMirrored;
-mod threat_inputs;
+use crate::full_threats::ThreatInputsBucketsMirrored;
+mod full_threats;
 
 #[derive(Clone, Copy, Default)]
 pub struct SfMaterialCount;
