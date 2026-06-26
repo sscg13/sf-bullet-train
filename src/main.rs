@@ -180,8 +180,8 @@ fn main() {
             )
             .select(buckets); // + l1_fact.forward(out);
 
-            let skip_neuron = out.slice_rows(15, 16);
-            out = out.slice_rows(0, 15);
+            let skip_neuron = out.slice_rows(L2, L2 + 1);
+            out = out.slice_rows(0, L2);
 
             let squared = (out.abs_pow(2.0) + FAKE_QUANTIZE_EPS)
                 .faux_quantise(HIDDEN_QUANTIZED_ONE as f32, false);

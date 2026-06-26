@@ -41,10 +41,10 @@ def fc_hash(L1, L2, L3, num_ls_buckets=8):
     
     for out_features, has_relu in layers_info:
         layer_hash = 0xCC03DAE4
-        layer_hash += out_features // num_ls_buckets
+        layer_hash += out_features
         layer_hash ^= prev_hash >> 1
         layer_hash ^= (prev_hash << 31) & 0xFFFFFFFF
-        if out_features // num_ls_buckets != 1 and has_relu:
+        if out_features != 1 and has_relu:
             # Clipped ReLU hash
             layer_hash = (layer_hash + 0x538D24C7) & 0xFFFFFFFF
         prev_hash = layer_hash
@@ -165,13 +165,12 @@ def organize_into_buckets(data, L1, L2, L3, num_buckets=8):
 
         weights = data['l2w'][weights_start:weights_end]
         
-        # EDIT: I think this needs to be aligned to 32 elements, so add two zeros after every L2*2 (30) elements
-        # Insert two zeros after every L2*2 (30) elements
+        # FC inputs are padded to 32 elements by the .nnue spec.
         modified_weights = []
         for i in range(0, len(weights), L2 * 2):
             chunk = weights[i:i + L2 * 2]
             modified_weights.extend(chunk)
-            modified_weights.extend([0, 0])
+            modified_weights.extend([0] * ((32 - len(chunk) % 32) % 32))
         
         bucketed_data['l2'].append({
             'bias': data['l2b'][bias_start:bias_end],
@@ -199,7 +198,7 @@ def sha256_file(path):
             h.update(chunk)
     return h.hexdigest()
 
-def convert_binary_format(input_file, L1=128, L2=15, L3=32, num_buckets=8):
+def convert_binary_format(input_file, L1=256, L2=31, L3=32, num_buckets=8):
     # Read the input binary file
     data = read_binary_file(input_file, L1, L2, L3, num_buckets)
 
@@ -293,8 +292,8 @@ def convert_binary_format(input_file, L1=128, L2=15, L3=32, num_buckets=8):
 def main():
     parser = argparse.ArgumentParser(description='Convert binary neural network format')
     parser.add_argument('input_file', type=str, help='Input binary file path')
-    parser.add_argument('--L1', type=int, default=128, help='L1 parameter (default: 128)')
-    parser.add_argument('--L2', type=int, default=15, help='L2 parameter (default: 15)')
+    parser.add_argument('--L1', type=int, default=256, help='L1 parameter (default: 256)')
+    parser.add_argument('--L2', type=int, default=31, help='L2 parameter (default: 31)')
     parser.add_argument('--L3', type=int, default=32, help='L3 parameter (default: 32)')
     parser.add_argument('--buckets', type=int, default=8, help='Number of buckets (default: 8)')
     
