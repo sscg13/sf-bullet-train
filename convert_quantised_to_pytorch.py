@@ -1,5 +1,9 @@
 import struct
 import argparse
+import hashlib
+import os
+import tempfile
+from pathlib import Path
 
 FULL_THREATS_HASH = 0x8F234CB8
 HALFKA_V2_HM_HASH = 0x7F234CB8
@@ -172,7 +176,14 @@ def organize_into_buckets(data, L1, L2, L3, num_buckets=8):
     
     return bucketed_data
 
-def convert_binary_format(input_file, output_file, L1=128, L2=15, L3=32, num_buckets=8):
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def convert_binary_format(input_file, L1=128, L2=15, L3=32, num_buckets=8):
     # Read the input binary file
     data = read_binary_file(input_file, L1, L2, L3, num_buckets)
 
@@ -186,9 +197,14 @@ def convert_binary_format(input_file, output_file, L1=128, L2=15, L3=32, num_buc
     # Calculate hashes
     # fc_hash_val = fc_hash(L1, L2, L3, num_buckets)
 
-    print(f"Writing to {output_file}...")
+    input_path = Path(input_file)
+    output_dir = input_path.resolve().parent
+    temp_fd, temp_output = tempfile.mkstemp(prefix='.nnue-', suffix='.tmp', dir=output_dir)
+    os.close(temp_fd)
+
+    print(f"Writing temporary NNUE to {temp_output}...")
     
-    with open(output_file, 'wb') as outfile:
+    with open(temp_output, 'wb') as outfile:
         # Write header
         fc_hash_val = fc_hash(L1, L2, L3, num_buckets)
 
@@ -251,12 +267,16 @@ def convert_binary_format(input_file, output_file, L1=128, L2=15, L3=32, num_buc
             outfile.write(struct.pack('<' + 'b' * len(bucketed_data['l3'][bucket]['weights']), 
                                      *bucketed_data['l3'][bucket]['weights']))
 
+    digest = sha256_file(temp_output)
+    output_file = output_dir / f"nn-{digest[:12]}.nnue"
+    os.replace(temp_output, output_file)
+    return output_file
+
 
 
 def main():
     parser = argparse.ArgumentParser(description='Convert binary neural network format')
     parser.add_argument('input_file', type=str, help='Input binary file path')
-    parser.add_argument('output_file', type=str, help='Output binary file path')
     parser.add_argument('--L1', type=int, default=128, help='L1 parameter (default: 128)')
     parser.add_argument('--L2', type=int, default=15, help='L2 parameter (default: 15)')
     parser.add_argument('--L3', type=int, default=32, help='L3 parameter (default: 32)')
@@ -264,8 +284,8 @@ def main():
     
     args = parser.parse_args()
     
-    convert_binary_format(args.input_file, args.output_file, args.L1, args.L2, args.L3, args.buckets)
-    print(f"Conversion complete: {args.input_file} -> {args.output_file}")
+    output_file = convert_binary_format(args.input_file, args.L1, args.L2, args.L3, args.buckets)
+    print(f"Conversion complete: {args.input_file} -> {output_file}")
 
 
 if __name__ == "__main__":
