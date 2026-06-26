@@ -9,7 +9,7 @@ use bullet::{
     },
     nn::{
         optimiser::{Ranger, RangerParams},
-        Affine, InitSettings, ModelNode, Shape,
+        Affine, InitSettings, ModelBuilder, ModelNode, Shape,
     },
     trainer::{
         save::SavedFormat,
@@ -79,17 +79,24 @@ fn merge_factoriser(weights: &[f32], output_size: usize) -> Vec<f32> {
         .collect::<Vec<f32>>()
 }
 
+fn fake_quantise_ste<'a>(
+    builder: &'a ModelBuilder,
+    input: ModelNode<'a>,
+    scale: f32,
+    round: bool,
+) -> ModelNode<'a> {
+    input + builder.with_no_grad(|| input.faux_quantise(scale, round) - input)
+}
+
 fn quantised_affine_forward<'a>(
+    builder: &'a ModelBuilder,
     layer: Affine<'a>,
     input: ModelNode<'a>,
     weight_scale: i16,
     bias_scale: i32,
 ) -> ModelNode<'a> {
-    layer
-        .weights
-        .faux_quantise(weight_scale as f32, true)
-        .matmul(input)
-        + layer.bias.faux_quantise(bias_scale as f32, true)
+    fake_quantise_ste(builder, layer.weights, weight_scale as f32, true).matmul(input)
+        + fake_quantise_ste(builder, layer.bias, bias_scale as f32, true)
 }
 
 fn main() {
@@ -160,19 +167,33 @@ fn main() {
             );
 
             // inference
+            let stm_subnet = quantised_affine_forward(
+                builder,
+                l0,
+                stm,
+                FT_QUANTIZED_ONE,
+                FT_QUANTIZED_ONE as i32,
+            )
+            .clip_pass_through_grad(0.0, FT_ACT_MAX)
+            .pairwise_mul();
             let stm_subnet =
-                (quantised_affine_forward(l0, stm, FT_QUANTIZED_ONE, FT_QUANTIZED_ONE as i32)
-                    .clip_pass_through_grad(0.0, FT_ACT_MAX))
-                .pairwise_mul()
-                .faux_quantise(HIDDEN_QUANTIZED_ONE as f32, false);
+                fake_quantise_ste(builder, stm_subnet, HIDDEN_QUANTIZED_ONE as f32, false);
+
+            let ntm_subnet = quantised_affine_forward(
+                builder,
+                l0,
+                ntm,
+                FT_QUANTIZED_ONE,
+                FT_QUANTIZED_ONE as i32,
+            )
+            .clip_pass_through_grad(0.0, FT_ACT_MAX)
+            .pairwise_mul();
             let ntm_subnet =
-                (quantised_affine_forward(l0, ntm, FT_QUANTIZED_ONE, FT_QUANTIZED_ONE as i32)
-                    .clip_pass_through_grad(0.0, FT_ACT_MAX))
-                .pairwise_mul()
-                .faux_quantise(HIDDEN_QUANTIZED_ONE as f32, false);
+                fake_quantise_ste(builder, ntm_subnet, HIDDEN_QUANTIZED_ONE as f32, false);
             let mut out = stm_subnet.concat(ntm_subnet);
 
             out = quantised_affine_forward(
+                builder,
                 l1,
                 out,
                 WEIGHT_SCALE_L1,
@@ -183,25 +204,35 @@ fn main() {
             let skip_neuron = out.slice_rows(L2, L2 + 1);
             out = out.slice_rows(0, L2);
 
-            let squared = (out.abs_pow(2.0) + FAKE_QUANTIZE_EPS)
-                .faux_quantise(HIDDEN_QUANTIZED_ONE as f32, false);
-            let linear =
-                (out + FAKE_QUANTIZE_EPS).faux_quantise(HIDDEN_QUANTIZED_ONE as f32, false);
+            let squared = fake_quantise_ste(
+                builder,
+                out.abs_pow(2.0) + FAKE_QUANTIZE_EPS,
+                HIDDEN_QUANTIZED_ONE as f32,
+                false,
+            );
+            let linear = fake_quantise_ste(
+                builder,
+                out + FAKE_QUANTIZE_EPS,
+                HIDDEN_QUANTIZED_ONE as f32,
+                false,
+            );
             out = squared
                 .concat(linear)
                 .clip_pass_through_grad(0.0, HIDDEN_ACT_MAX);
 
-            out = (quantised_affine_forward(
+            out = quantised_affine_forward(
+                builder,
                 l2,
                 out,
                 WEIGHT_SCALE_L2,
                 (WEIGHT_SCALE_L2 as i32) * (HIDDEN_QUANTIZED_ONE as i32),
             )
             .select(buckets)
-                + FAKE_QUANTIZE_EPS)
-                .faux_quantise(HIDDEN_QUANTIZED_ONE as f32, false)
+                + FAKE_QUANTIZE_EPS;
+            out = fake_quantise_ste(builder, out, HIDDEN_QUANTIZED_ONE as f32, false)
                 .clip_pass_through_grad(0.0, HIDDEN_ACT_MAX);
             out = quantised_affine_forward(
+                builder,
                 l3,
                 out,
                 WEIGHT_SCALE_OUT,
@@ -212,10 +243,12 @@ fn main() {
             let stm_pst = pst.matmul(stm).select(buckets);
             let ntm_pst = pst.matmul(ntm).select(buckets);
             let pst_out = 0.5 * stm_pst - 0.5 * ntm_pst;
-            out = (out + skip_neuron)
-                .faux_quantise(OUTPUT_DENOMINATOR as f32, true)
-                .faux_quantise(PSQT_SCALE as f32, false)
-                + pst_out;
+            out = fake_quantise_ste(
+                builder,
+                fake_quantise_ste(builder, out + skip_neuron, OUTPUT_DENOMINATOR as f32, true),
+                PSQT_SCALE as f32,
+                false,
+            ) + pst_out;
 
             out
         });
