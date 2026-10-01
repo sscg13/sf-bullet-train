@@ -1,0 +1,4 @@
+rnbkqbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBKQBNR w - - 0 1 | 0 | 0.5
+rnbkqbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBKQBNR b - - 0 1 | 0 | 0.5
+7k/8/3q4/5b2/2B5/4Q3/8/K7 w - - 0 1 | 120 | 1.0
+7k/8/3q4/5b2/2B5/4Q3/8/K7 b - - 0 1 | 120 | 1.0
