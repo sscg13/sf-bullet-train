@@ -1,2 +1,4 @@
 /target
 checkpoints
+/.upstream
+__pycache__/

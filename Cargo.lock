@@ -31,14 +31,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ace50bade8e6234aa140d9a2f552bbee1db4d353f69b8217bc503490fc1a9f26"
 
 [[package]]
-name = "binpack"
-version = "0.1.0"
-source = "git+https://github.com/Disservin/binpack-rust?rev=483e9aac028b4c3e0671af6b28ff50f64d696558#483e9aac028b4c3e0671af6b28ff50f64d696558"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -313,7 +305,6 @@ dependencies = [
 name = "sf-bullet-train"
 version = "0.1.0"
 dependencies = [
- "binpack",
  "bullet_lib",
  "bulletformat",
 ]

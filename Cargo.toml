@@ -3,11 +3,14 @@ name = "sf-bullet-train"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["cuda"]
+cuda = ["bullet/cuda"]
+cpu = ["bullet/cpu"]
+
 [dependencies]
-#bullet = { git = "https://github.com/jw1912/bullet", package = "bullet_lib", default-features = false, features = ["cuda"] }
-bullet = { git = "https://github.com/jw1912/bullet", package = "bullet_lib", rev = "e37db79ee3ee54be2a2f310004b1b82f3b60c0ca", default-features = false, features = ["cuda"] }
+bullet = { git = "https://github.com/jw1912/bullet", package = "bullet_lib", rev = "e37db79ee3ee54be2a2f310004b1b82f3b60c0ca", default-features = false }
 bulletformat = "1.7.0"
-sfbinpack = { package = "binpack", git = "https://github.com/Disservin/binpack-rust", rev = "483e9aac028b4c3e0671af6b28ff50f64d696558"}
 
 [profile.release]
 lto = true
